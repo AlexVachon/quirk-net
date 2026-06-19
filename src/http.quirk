@@ -1,8 +1,11 @@
 ---
-A minimal HTTP/1.1 client over the raw `Socket` primitives.
+A minimal HTTP/1.1 client over the raw `Socket` primitives, with
+TLS support for `https://` URLs via OpenSSL (since v3.7.0).
 
-Supports plain HTTP only — `https://` URLs will fail because there is no
-TLS in the runtime yet.
+Cert verification is on by default against the system CA bundle;
+SNI is set to the URL host for both connection and certificate
+hostname check. There's no in-process knob to opt out of
+verification today — if a target really needs that, file an issue.
 
 Public API:
   `http.get(url, headers=, params=)`         — GET request
@@ -28,6 +31,7 @@ from typing.primitives.string use { String }
 from typing.collections.map use { Map }
 from typing.exceptions.types use { ValueError }
 from net.socket use { Socket }
+from net use { tls_connect, tls_send, tls_recv, tls_close }
 use url
 from url use { URL }
 use encoding.json
@@ -123,6 +127,45 @@ define _decode_chunked(body: String) -> String {
 // any caller-supplied `params` map into the URL's existing query. Empty
 // params returns the original `path` unchanged. The result is whatever
 // goes after the verb in `GET <here> HTTP/1.1`.
+// Send `req` over a fresh connection to `host:port` and read until the
+// peer closes (HTTP/1.1 + `Connection: close` semantics — matches the
+// header we add by default in `_request_with_depth`). When `use_tls`
+// is true the connection is wrapped with libssl: handshake, SNI,
+// cert verify against the system CA bundle. Returns the raw response
+// bytes (headers + body, exactly what came off the wire).
+//
+// Factored out of `_request_with_depth` so the plain-HTTP and HTTPS
+// paths share one read loop instead of two. Throws SocketError via
+// the Socket wrapper on the plain side; throws ValueError on the TLS
+// side when the handshake fails (-1 from `tls_connect`).
+define _send_and_read(host: String, port: Int, req: String, use_tls: Bool) -> String {
+    chunks := List()
+    if use_tls {
+        handle := tls_connect(host, port)
+        if handle < 0 {
+            throw ValueError("TLS connect to " + host + ":" + port.str() + " failed (handshake, DNS, or cert verification)")
+        }
+        tls_send(handle, req)
+        while true {
+            chunk := tls_recv(handle, 4096)
+            if chunk.length() == 0 { break }
+            chunks.append(chunk)
+        }
+        tls_close(handle)
+    } else {
+        with Socket() as s {
+            s.connect(host, port)
+            s.send(req)
+            while true {
+                chunk := s.recv(4096)
+                if chunk.length() == 0 { break }
+                chunks.append(chunk)
+            }
+        }
+    }
+    return "".join(chunks)
+}
+
 define _path_with_query(parsed_path: String, parsed_query: String, params: Map) -> String {
     extra := ""
     if params.length() > 0 {
@@ -168,7 +211,7 @@ Send a single HTTP request and return the response. Lower-level form
 behind `get`/`post`/`delete`/`post_json`.
 
 @param method HTTP verb (GET, POST, DELETE, PUT, ...) — case-insensitive.
-@param target Full URL starting with `http://`. HTTPS is not supported.
+@param target Full URL starting with `http://` or `https://`.
 @param data Request body — pass "" for GET/DELETE.
 @param headers Extra headers to send (case-preserved). Caller-supplied
        Host / User-Agent / Connection / Content-Length override the defaults.
@@ -192,114 +235,110 @@ define _request_with_depth(method: String, target: String, data: String, headers
     host := u.host
     path := u.path
     if path.length() == 0 { path = "/" }
+    use_tls := u.scheme == "https"
     port := u.port
-    if port == 0 { port = 80 }
+    if port == 0 {
+        if use_tls { port = 443 } else { port = 80 }
+    }
 
     full_path := _path_with_query(path, u.query, params)
     upper := method.upper()
 
-    with Socket() as s {
-        s.connect(host, port)
-
-        // Build the request line + default headers, then merge caller
-        // headers on top (caller wins for everything except internal
-        // mechanics like Content-Length which has to match the body).
-        req := upper + " " + full_path + " HTTP/1.1\r\n"
-        seen := _lowercase_keys(headers)
-        if seen.has("host") == false {
-            req += "Host: " + host + "\r\n"
-        }
-        if seen.has("user-agent") == false {
-            req += "User-Agent: Quirk/1.0\r\n"
-        }
-        if seen.has("connection") == false {
-            req += "Connection: close\r\n"
-        }
-        if data.length() > 0 and seen.has("content-length") == false {
-            req += "Content-Length: " + data.length().str() + "\r\n"
-        }
-        // Append caller-supplied headers verbatim.
-        hkeys := headers.keys()
-        hi := 0
-        while hi < hkeys.length() {
-            k: String = hkeys.get(hi)
-            v: String = headers.get(k)
-            req += k + ": " + v + "\r\n"
-            hi = hi + 1
-        }
-        req += "\r\n" + data
-        s.send(req)
-
-        chunks := List()
-        while true {
-            chunk := s.recv(4096)
-            if chunk.length() == 0 { break }
-            chunks.append(chunk)
-        }
-        raw_response := "".join(chunks)
-        header_end := raw_response.find("\r\n\r\n")
-        if header_end == -1 {
-            return Response(500, "", Map())
-        }
-        headers_raw := raw_response.substring(0, header_end)
-        raw_body := raw_response.substring(header_end + 4, raw_response.length())
-        body := raw_body
-        if headers_raw.lower().contains("transfer-encoding: chunked") {
-            body = _decode_chunked(raw_body)
-        }
-        lines := headers_raw.split("\r\n")
-        status_line: String = lines.get(0)
-        status_parts := status_line.split(" ")
-        status_code := 0
-        if status_parts.length() > 1 {
-            code_str: String = status_parts.get(1)
-            status_code = code_str.to_int()
-        }
-        headers_map := Map()
-        i := 1
-        while i < lines.length() {
-            line: String = lines.get(i)
-            split_idx := line.find(":")
-            if split_idx != -1 {
-                key := line.substring(0, split_idx).trim()
-                val := line.substring(split_idx + 1, line.length()).trim()
-                headers_map.put(key, val)
-            }
-            i = i + 1
-        }
-
-        // Redirect chain. Stop at depth=5 to match curl's default and
-        // avoid pathological loops. 303 (and POST → 301/302 by
-        // convention) switches the next hop to GET with no body.
-        if follow_redirects and _is_redirect(status_code) and depth < 5 {
-            location: String = headers_map.get("Location")
-            if location.length() == 0 {
-                location = headers_map.get("location")
-            }
-            if location.length() > 0 {
-                next_method := upper
-                next_body := data
-                if status_code == 303 or ((status_code == 301 or status_code == 302) and upper == "POST") {
-                    next_method = "GET"
-                    next_body = ""
-                }
-                // Resolve relative Location values against the original
-                // URL. RFC 7231 §7.1.2 allows the server to return either
-                // an absolute URI or a relative ref; httpbin returns the
-                // latter for /redirect/N.
-                next_url := location
-                if location.startswith("/") {
-                    next_url = "http://" + host + ":" + port.str() + location
-                } elif location.startswith("http://") == false and location.startswith("https://") == false {
-                    next_url = "http://" + host + ":" + port.str() + "/" + location
-                }
-                return _request_with_depth(next_method, next_url, next_body,
-                                            headers, Map(), follow_redirects, depth + 1)
-            }
-        }
-
-        return Response(status_code, body, headers_map)
+    // Build the request line + default headers, then merge caller
+    // headers on top (caller wins for everything except internal
+    // mechanics like Content-Length which has to match the body).
+    req := upper + " " + full_path + " HTTP/1.1\r\n"
+    seen := _lowercase_keys(headers)
+    if seen.has("host") == false {
+        req += "Host: " + host + "\r\n"
     }
+    if seen.has("user-agent") == false {
+        req += "User-Agent: Quirk/1.0\r\n"
+    }
+    if seen.has("connection") == false {
+        req += "Connection: close\r\n"
+    }
+    if data.length() > 0 and seen.has("content-length") == false {
+        req += "Content-Length: " + data.length().str() + "\r\n"
+    }
+    // Append caller-supplied headers verbatim.
+    hkeys := headers.keys()
+    hi := 0
+    while hi < hkeys.length() {
+        k: String = hkeys.get(hi)
+        v: String = headers.get(k)
+        req += k + ": " + v + "\r\n"
+        hi = hi + 1
+    }
+    req += "\r\n" + data
+
+    raw_response := _send_and_read(host, port, req, use_tls)
+    header_end := raw_response.find("\r\n\r\n")
+    if header_end == -1 {
+        return Response(500, "", Map())
+    }
+    headers_raw := raw_response.substring(0, header_end)
+    raw_body := raw_response.substring(header_end + 4, raw_response.length())
+    body := raw_body
+    if headers_raw.lower().contains("transfer-encoding: chunked") {
+        body = _decode_chunked(raw_body)
+    }
+    lines := headers_raw.split("\r\n")
+    status_line: String = lines.get(0)
+    status_parts := status_line.split(" ")
+    status_code := 0
+    if status_parts.length() > 1 {
+        code_str: String = status_parts.get(1)
+        status_code = code_str.to_int()
+    }
+    headers_map := Map()
+    i := 1
+    while i < lines.length() {
+        line: String = lines.get(i)
+        split_idx := line.find(":")
+        if split_idx != -1 {
+            key := line.substring(0, split_idx).trim()
+            val := line.substring(split_idx + 1, line.length()).trim()
+            headers_map.put(key, val)
+        }
+        i = i + 1
+    }
+
+    // Redirect chain. Stop at depth=5 to match curl's default and
+    // avoid pathological loops. 303 (and POST → 301/302 by
+    // convention) switches the next hop to GET with no body.
+    if follow_redirects and _is_redirect(status_code) and depth < 5 {
+        location: String = headers_map.get("Location")
+        if location.length() == 0 {
+            location = headers_map.get("location")
+        }
+        if location.length() > 0 {
+            next_method := upper
+            next_body := data
+            if status_code == 303 or ((status_code == 301 or status_code == 302) and upper == "POST") {
+                next_method = "GET"
+                next_body = ""
+            }
+            // Resolve relative Location values against the original
+            // URL. RFC 7231 §7.1.2 allows the server to return either
+            // an absolute URI or a relative ref; httpbin returns the
+            // latter for /redirect/N. Preserve the original scheme so
+            // an https→relative→https chain doesn't accidentally
+            // downgrade to plain http (or vice versa).
+            base_scheme := "http"
+            if use_tls { base_scheme = "https" }
+            next_url := location
+            if location.startswith("/") {
+                next_url = base_scheme + "://" + host + ":" + port.str() + location
+            } elif location.startswith("http://") == false and location.startswith("https://") == false {
+                next_url = base_scheme + "://" + host + ":" + port.str() + "/" + location
+            }
+            return _request_with_depth(next_method, next_url, next_body,
+                                        headers, Map(), follow_redirects, depth + 1)
+        }
+    }
+
+    return Response(status_code, body, headers_map)
 }
 
 ---

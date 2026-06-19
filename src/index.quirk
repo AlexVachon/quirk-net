@@ -65,3 +65,36 @@ extern define recv(fd: Int, size: Int) -> String
 Close socket `fd`, releasing the OS resource.
 ---
 extern define close(fd: Int) -> void
+
+---
+Open a TLS-wrapped TCP connection to `host:port`. The handshake is
+performed eagerly with SNI set to `host` and the cert verified
+against the system CA bundle. Returns an opaque handle (Int) for
+use with `tls_send` / `tls_recv` / `tls_close`, or `-1` on any
+failure (DNS, connect, handshake, or verification).
+
+Used by the `https://` path in `net.http`; most users want
+`http.get(url)` rather than calling this directly.
+---
+extern define tls_connect(host: String, port: Int) -> Int
+
+---
+Send `data` over a TLS handle returned by `tls_connect`. Returns
+the number of bytes accepted by SSL_write (may be less than
+`data.length()` for partial writes).
+---
+extern define tls_send(handle: Int, data: String) -> Int
+
+---
+Read up to `size` plaintext bytes from a TLS handle. Returns the
+data as a String. An empty string indicates the peer closed the
+connection (or an SSL_read error — TLS-aware HTTP clients treat
+either the same way: stop reading and assemble what we have).
+---
+extern define tls_recv(handle: Int, size: Int) -> String
+
+---
+Tear down a TLS handle: SSL_shutdown + SSL_free + close the
+underlying TCP fd, and release the slot back to the table.
+---
+extern define tls_close(handle: Int) -> void
