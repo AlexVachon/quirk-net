@@ -62,6 +62,31 @@ struct Response {
     define __str(self) -> String {
         return "<Response [${self.status_code.str()}]>"
     }
+
+    ---
+    Parse the response body as JSON. Equivalent to
+    `encoding.json.parse(self.text)`. Returns the decoded value
+    (Map / List / String / Int / Double / Bool / null) typed as Any.
+
+    Throws ValueError when the body isn't valid JSON. Status code is
+    not consulted — callers wanting a strict "2xx + valid JSON" path
+    should check `self.ok` first.
+
+    Annotate the receiving variable with the concrete type you expect
+    (`data: Map := resp.json()`) — bare `data :=` keeps the binding as
+    Any, which downstream `.get` / `.length` calls won't pick the
+    right method for.
+
+    @example
+    resp := http.get("https://api.example.com/user/42")
+    if resp.ok {
+        data: Map := resp.json()
+        print(data.get("name"))
+    }
+    ---
+    define json(self) -> Any {
+        return json.parse(self.text)
+    }
 }
 
 define _hex_to_int(s: String) -> Int {

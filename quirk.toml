@@ -1,5 +1,5 @@
 name          = "net"
-version       = "1.1.0"
+version       = "1.2.0"
 license       = "MIT"
 description   = "Network entry point. Re-exports the high-level `Socket` struct and exposes the low-level POSIX-style socket primitives that `Socket` is built on. Most users want `from net.socket use { Socket }` for t"
 repository    = "github.com/AlexVachon/quirk-net"
