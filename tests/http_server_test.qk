@@ -1,0 +1,94 @@
+// net.server — unit tests for the parsing and response-formatting
+// helpers. A full end-to-end accept-loop test would need cross-process
+// orchestration plus a working struct-through-Callable return value;
+// the latter has a known wart in the current compiler (returning a
+// struct from a Callable can lose its type). We test the surface that's
+// stable: parse the wire format, build the wire format.
+
+use net.server
+from net.server use {
+    Request,
+    _parse_request, _read_headers, _read_body,
+    _header_lookup, _reason_for, _format_response
+}
+from net.http use { Response }
+use test
+
+// parse a basic GET request
+define test_parse_get() -> void {
+    raw := "GET /users HTTP/1.1\r\nHost: example.com\r\nAccept: text/html\r\n\r\n"
+    req := _parse_request(raw)
+    test.assert_eq(req.method, "GET")
+    test.assert_eq(req.path, "/users")
+    test.assert_eq(req.headers.length(), 2)
+    test.assert_eq("" + req.headers.get("Host"), "example.com")
+}
+
+// parse splits query string into map
+define test_parse_query() -> void {
+    raw := "GET /search?q=hello&page=2 HTTP/1.1\r\nHost: x\r\n\r\n"
+    req := _parse_request(raw)
+    test.assert_eq(req.path, "/search")
+    test.assert_eq("" + req.query.get("q"), "hello")
+    test.assert_eq("" + req.query.get("page"), "2")
+}
+
+// parse preserves body after header terminator
+define test_parse_post_body() -> void {
+    raw := "POST /sum HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\na=3&b=4"
+    req := _parse_request(raw)
+    test.assert_eq(req.method, "POST")
+    test.assert_eq(req.body, "a=3&b=4")
+}
+
+// parse returns empty method on malformed request line
+define test_parse_bad() -> void {
+    // Single token on the request line — no path, no version.
+    raw := "GARBAGE\r\nHost: x\r\n\r\n"
+    req := _parse_request(raw)
+    test.assert_eq(req.method, "")
+}
+
+// header lookup is case-insensitive and miss-safe
+define test_header_lookup() -> void {
+    h := Map()
+    h.put("Content-Type", "application/json")
+    test.assert_eq(_header_lookup(h, "content-type"), "application/json")
+    test.assert_eq(_header_lookup(h, "Content-Type"), "application/json")
+    // A miss returns "" — not the "null" string that .get would
+    // stringify to, which would crash .to_int() downstream.
+    test.assert_eq(_header_lookup(h, "X-Missing"), "")
+}
+
+// reason phrase mapping covers common codes
+define test_reason() -> void {
+    test.assert_eq(_reason_for(200), "OK")
+    test.assert_eq(_reason_for(404), "Not Found")
+    test.assert_eq(_reason_for(500), "Internal Server Error")
+    // Unknown codes fall back to "OK" (informational only).
+    test.assert_eq(_reason_for(418), "OK")
+}
+
+// format_response emits valid HTTP/1.1 wire format
+define test_format() -> void {
+    resp := Response(200, "hi", Map())
+    wire := _format_response(resp)
+    // Status line.
+    test.assert_true(wire.startswith("HTTP/1.1 200 OK\r\n"))
+    // Body length tracked accurately.
+    test.assert_true(wire.contains("Content-Length: 2\r\n"))
+    // Body comes after the terminator, unaltered.
+    test.assert_true(wire.endswith("\r\n\r\nhi"))
+}
+
+// custom response headers pass through
+define test_format_custom() -> void {
+    h := Map()
+    h.put("X-App", "quirk")
+    resp := Response(201, "{}", h)
+    wire := _format_response(resp)
+    test.assert_true(wire.startswith("HTTP/1.1 201 Created\r\n"))
+    test.assert_true(wire.contains("X-App: quirk\r\n"))
+    test.assert_true(wire.endswith("\r\n\r\n{}"))
+}
+
