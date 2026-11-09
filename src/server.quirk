@@ -209,9 +209,43 @@ define _format_response(resp: Response) -> String {
 }
 
 ---
-A simple HTTP/1.1 server. Holds the listener socket and an exit flag so
-`stop()` can break the accept-loop from another thread once Quirk gains
-that ability — for now `listen` runs forever.
+Serve one connection: read the request, call `handler`, send its response,
+close. Runs as a task (compiler 7.12.0+), so a slow handler doesn't hold
+up other clients — `listen` starts one per connection.
+---
+async define _serve(client: Socket, handler: Callable) {
+    with client as conn {
+        raw := _read_headers(conn)
+        req := _parse_request(raw)
+        if req.method.length() == 0 {
+            conn.send(_format_response(Response(400, "bad request", Map())))
+        } else {
+            // If there's a Content-Length, fetch the rest of the body.
+            // _read_headers may already have pulled some of it past the
+            // separator.
+            cl_str := _header_lookup(req.headers, "Content-Length")
+            if cl_str.length() > 0 {
+                n := cl_str.to_int()
+                if n > req.body.length() {
+                    full := _read_body(conn, req.body, n)
+                    req.body = full
+                }
+            }
+            resp: Response = Response(500, "", Map())
+            try {
+                resp = handler(req)
+            } catch (e: Exception) {
+                resp = Response(500, "handler error: " + e.message, Map())
+            }
+            conn.send(_format_response(resp))
+        }
+    }
+}
+
+---
+A simple HTTP/1.1 server. Each connection is handled in its own task, so
+requests are served concurrently: while one handler waits (on a socket,
+`sys.sleep`, or `await`), others run.
 ---
 struct Server {
     _running: Bool = false
@@ -222,8 +256,8 @@ struct Server {
 
     ---
     Block forever, accepting connections on `host:port` and dispatching
-    each parsed `Request` to `handler`. The handler returns a `Response`
-    which is sent back and the connection is closed.
+    each parsed `Request` to `handler` in its own task. The handler returns
+    a `Response`, which is sent back before the connection is closed.
 
     Exceptions raised by the handler are caught and converted to a plain
     500 — they don't take the server down.
@@ -236,35 +270,10 @@ struct Server {
     define listen(self, host: String, port: Int, handler: Callable) -> void {
         with Socket() as listener {
             listener.bind(host, port)
-            listener.listen(16)
+            listener.listen(64)
             self._running = true
             while self._running {
-                with listener.accept() as client {
-                    raw := _read_headers(client)
-                    req := _parse_request(raw)
-                    if req.method.length() == 0 {
-                        client.send(_format_response(Response(400, "bad request", Map())))
-                    } else {
-                        // If there's a Content-Length, fetch the rest of
-                        // the body. _read_headers may already have pulled
-                        // some of it past the separator.
-                        cl_str := _header_lookup(req.headers, "Content-Length")
-                        if cl_str.length() > 0 {
-                            n := cl_str.to_int()
-                            if n > req.body.length() {
-                                full := _read_body(client, req.body, n)
-                                req.body = full
-                            }
-                        }
-                        resp: Response = Response(500, "", Map())
-                        try {
-                            resp = handler(req)
-                        } catch (e: Exception) {
-                            resp = Response(500, "handler error: " + e.message, Map())
-                        }
-                        client.send(_format_response(resp))
-                    }
-                }
+                _serve(listener.accept(), handler)
             }
         }
     }
