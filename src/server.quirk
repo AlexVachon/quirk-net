@@ -185,6 +185,9 @@ define _reason_for(code: Int) -> String {
     return "OK"
 }
 
+// Bytes in a String (runtime: Net_Server_byte_length in libs/web.c).
+extern define byte_length(s: String) -> Int
+
 // Serialize a Response into the HTTP/1.1 wire format. Always sets
 // Content-Length to the body length and Connection: close (we use
 // one-shot connections for simplicity). Caller-supplied headers are
@@ -194,7 +197,9 @@ define _format_response(resp: Response) -> String {
     code_str := resp.status_code.str()
     reason := _reason_for(resp.status_code)
     out := "HTTP/1.1 " + code_str + " " + reason + "\r\n"
-    out += "Content-Length: " + resp.text.length().str() + "\r\n"
+    // Bytes, not characters: "é" is 2 (with length() the browser cut
+    // non-ASCII responses short).
+    out += "Content-Length: " + byte_length(resp.text).str() + "\r\n"
     out += "Connection: close\r\n"
     keys := resp.headers.keys()
     i := 0
